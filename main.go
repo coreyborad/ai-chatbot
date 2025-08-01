@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"linebot-grok/gemini"
+	"linebot-grok/grok"
+	"linebot-grok/utils"
 	"log"
 	"net/http"
 	"net/url"
@@ -13,13 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/line/line-bot-sdk-go/v8/linebot"
 	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
 	"github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 	"github.com/patrickmn/go-cache"
-	"google.golang.org/genai"
 )
 
 var c = cache.New(5*time.Minute, 10*time.Minute)
@@ -288,59 +288,6 @@ func generateImageByGrok(userMsg string) (string, error) {
 	return imageURLs[0], nil
 }
 
-func generateImageByGemini(userMsg string) (string, error) {
-	ctx := context.Background()
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  os.Getenv("GEMINI_API_KEY"),
-		Backend: genai.BackendGeminiAPI,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	if client.ClientConfig().Backend == genai.BackendVertexAI {
-		fmt.Println("Calling VertexAI Backend...")
-	} else {
-		fmt.Println("Calling GeminiAPI Backend...")
-	}
-	maxOutputTokens := int32(256)
-	config := &genai.GenerateContentConfig{
-		HTTPOptions: &genai.HTTPOptions{
-			APIVersion: "v1beta",
-		},
-		MaxOutputTokens:    &maxOutputTokens,
-		ResponseModalities: []string{"IMAGE", "TEXT"},
-	}
-	// config.ResponseModalities = []string{"IMAGE", "TEXT"}
-	// Call the GenerateContent method.
-
-	promptMsg, err := getImgPromptByGrok(userMsg)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	result, err := client.Models.GenerateContent(ctx, "gemini-2.0-flash-exp-image-generation", genai.Text(promptMsg), config)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// 提取圖片資料
-	for _, cand := range result.Candidates {
-		if cand.Content != nil {
-			for _, part := range cand.Content.Parts {
-				if part.InlineData != nil {
-					uuid := uuid.New().String()
-					imgKey := fmt.Sprintf("%s.png", uuid)
-					imgCache.SetDefault(imgKey, part.InlineData.Data)
-					return host + "/img/" + imgKey, nil
-				}
-			}
-		}
-	}
-	jdata, _ := json.MarshalIndent(result, "", "  ")
-
-	fmt.Println("Image data not found in response", string(jdata))
-	return "", nil
-}
-
 const maxLength = 4999
 
 func splitString(input string) []string {
@@ -417,6 +364,7 @@ func main() {
 			return
 		}
 		chatID := cb.Destination
+		fmt.Println(chatID)
 		// Process each event
 		for _, event := range cb.Events {
 			switch e := event.(type) {
@@ -427,13 +375,21 @@ func main() {
 					// Check if message starts with "AI@"
 					if strings.HasPrefix(strings.ToLower(thisText), strings.ToLower("AI@")) {
 						// Extract the message content after "AI@"
-						grokMsg := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(thisText), strings.ToLower("AI@")))
-						if grokMsg == "" {
+						userMsg := strings.TrimSpace(strings.TrimPrefix(strings.ToLower(thisText), strings.ToLower("AI@")))
+						if userMsg == "" {
 							continue // Skip if no content after "AI@"
 						}
 
+						ip := utils.GetClientIP(r)
+						if ip == "" {
+							http.Error(w, "Could not determine client IP", http.StatusBadRequest)
+							log.Println("Could not determine client IP")
+							return
+						}
+						location := utils.GetLocationByIP(ip)
+
 						// Call Grok API
-						response, err := callGrokAPI(chatID, grokMsg)
+						response, err := gemini.GenerateByGeminiWithSearch(userMsg, location)
 						if err != nil {
 							log.Printf("Error calling Grok API: %v", err)
 							response = "Sorry, I couldn't process your request."
@@ -479,7 +435,7 @@ func main() {
 							}
 						} else {
 							// Call Grok API
-							response, err = generateImageByGemini(grokMsg)
+							response, err = gemini.GenerateImageByGemini(host, grokMsg)
 							if err != nil {
 								log.Printf("Error calling Gemini API: %v", err)
 								continue
@@ -504,6 +460,10 @@ func main() {
 			}
 		}
 	})
+
+	http.HandleFunc("/grok/chat", grok.GrokRoute)
+
+	http.HandleFunc("/gemini/chat", gemini.GeminiRoute)
 
 	// Start the server
 	port := os.Getenv("PORT")
